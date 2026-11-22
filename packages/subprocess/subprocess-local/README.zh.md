@@ -67,6 +67,8 @@ Windows 普通子进程通过 `windowsHide` 启动私有 Job runner，并为原�
 
 Linux 普通进程和终端进程即使在 bootstrap 消费启动请求前被取消，也会保留实际观察到的终止信号。如果没有请求对应的终止信号，未消费的请求仍会报启动失败；已记录的 pre-exec 错误始终优先。`waitForExit()` 独立证明 scope 已为空，其中也包括 payload 在进入该 scope 的 cgroup 前就被杀死、manager 因此让它保持 active 却没有任何进程的 scope。状态查询期间若发出终止信号，会重新查询后再判定清理是否成功。请求终止后，启动请求已消费且 scope 进程数为零即可证明完全停稳，无需等待直接进程的退出通知。如果最终 scope 信号发送失败，直接进程接受 `SIGKILL` 或被独立确认已不存在，owner 才可以等待一次尚未送达的直接进程停稳通知，再重新查询尚未证明为空的 active 范围。此等待独立于输出排空和整个范围的停稳。新取得的 scope 状态必须证明范围已为空；仍有进程存活或进程数未知时，仍报告信号失败。
 
+直接启动进程自然退出后，即使 systemd 仍将 scope 标为 active，提供方也能回收它。当 systemd 报告任务数为零，且该 scope 自身的 cgroup v2 `cgroup.events` 报告 `populated 0` 时，提供方异步请求停止该 scope。子树仍有进程或无法取得内核记录时，提供方继续观察，直到能确认状态。
+
 ### 可能出错的地方
 
 无法解析的可执行文件会明确报出稳定错误。当 spawn 或提供方故障使 direct outcome 无法产生时，`done` 会 reject；该 rejection 不能证明 target 是否已经开始执行：平台 spawn 错误保持为原始 Node 错误，而 Windows Job runner 启动后失败或其 IPC 通道损坏时以 `SubprocessError` 的 `SUBPROCESS_RUNNER_FAILED` 或 `SUBPROCESS_RUNNER_IPC_FAILED` reject。在无法加载 node-pty 的主机上请求终端会抛出 `SUBPROCESS_PTY_UNAVAILABLE`。若所选 owner 无法再证明其范围为空，`waitForExit()` 会 reject，清理仍会尝试终止。越过保留尾部的读取是 `lossy` 的，并在 spill 文件存在时指向它。fallback 进程组或已观察终端 session 可能遗漏在观察前逃逸的后代——见下文限制。

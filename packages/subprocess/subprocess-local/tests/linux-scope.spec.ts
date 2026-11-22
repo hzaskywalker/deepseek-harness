@@ -1,5 +1,6 @@
 import { EventEmitter } from 'node:events'
 import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs'
+import { readFile } from 'node:fs/promises'
 import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -42,6 +43,11 @@ vi.mock('node:child_process', async (importOriginal) => {
     spawn: childProcessMocks.spawn as typeof actual.spawn,
     spawnSync: childProcessMocks.spawnSync as typeof actual.spawnSync,
   }
+})
+
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const fs = await importOriginal<typeof import('node:fs/promises')>()
+  return { ...fs, readFile: vi.fn(fs.readFile) }
 })
 
 class FakeChild extends EventEmitter {
@@ -102,6 +108,21 @@ function activeUnitWithTasks(tasks: string) {
   return { status: 0, stdout: `LoadState=loaded\nActiveState=active\nTasksCurrent=${tasks}\n`, stderr: '' }
 }
 
+function cgroupFixture() {
+  const root = mkdtempSync(join(tmpdir(), 'dsh-cgroup-'))
+  directories.push(root)
+  return {
+    root,
+    active(unit: string, events: string | undefined) {
+      const group = `/user.slice/${unit}`
+      mkdirSync(join(root, group), { recursive: true })
+      if (events !== undefined) writeFileSync(join(root, group, 'cgroup.events'), events)
+      const state = activeUnitWithTasks('0')
+      return { ...state, stdout: state.stdout + `ControlGroup=${group}\n` }
+    },
+  }
+}
+
 /** Reject group delivery and accept direct-PID signals without reaching the host. */
 function denyProcessGroups(): void {
   vi.spyOn(process, 'kill').mockImplementation((pid) => {
@@ -148,6 +169,7 @@ function launch(
     ...overrides.runnerAvailable === undefined ? {} : { runnerAvailable: overrides.runnerAvailable },
     ...overrides.loadLinuxExecve === undefined ? {} : { loadLinuxExecve: overrides.loadLinuxExecve },
     ...overrides.sleep === undefined ? {} : { sleep: overrides.sleep },
+    ...overrides.cgroupRoot === undefined ? {} : { cgroupRoot: overrides.cgroupRoot },
   })
   const requestPath = options?.env?.[SUBPROCESS_RUNNER_ENV]
   if (requestPath === undefined) throw new Error('launch did not publish a request locator')
@@ -650,13 +672,15 @@ describe('Linux scope establishment and quiescence', () => {
     denyProcessGroups()
     const spawnSync = recordingSystemctl()
       .mockReturnValueOnce({ status: 1, stdout: '', stderr: 'Invalid argument' })
-    const launched = launch(async () => activeUnitWithTasks('0'), { spawnSync: spawnSync as never })
+    const query = vi.fn(async (_command: string, _args: readonly string[]) => activeUnitWithTasks('0'))
+    const launched = launch(query, { spawnSync: spawnSync as never })
     consumeLinuxLaunchRequest(launched.requestPath)
     launched.result.owner.signal('SIGKILL')
     launched.child.exit(null, 'SIGKILL')
     await expect(launched.result.owner.waitForExit()).resolves.toBeUndefined()
     await expect(launched.result.direct).resolves.toEqual({ exitCode: null, signal: 'SIGKILL' })
-    expect(spawnSync.mock.calls.map(call => call[1]?.[1])).toEqual(['kill', 'stop'])
+    expect(spawnSync.mock.calls.map(call => call[1]?.[1])).toEqual(['kill'])
+    expect(query.mock.calls.map(call => call[1][1])).toEqual(['show', 'stop'])
     launched.result.owner.cleanup?.()
   })
 
@@ -667,16 +691,17 @@ describe('Linux scope establishment and quiescence', () => {
     { state: 'unknown', fresh: activeUnitWithTasks('[not set]'), settles: false },
   ].flatMap(value => ['delivered', 'already absent'].map(delivery => ({ ...value, delivery })))
     .flatMap(value => [false, true].map(groupAccepted => ({ ...value, groupAccepted }))))(
-    'joins a $delivery direct kill with groupAccepted=$groupAccepted before deciding a $state scope', async ({ fresh, settles, delivery, groupAccepted }) => {
+    'joins a $delivery direct kill with groupAccepted=$groupAccepted before deciding a $state scope', async ({ state, fresh, settles, delivery, groupAccepted }) => {
       const processKill = vi.spyOn(process, 'kill').mockImplementation((pid) => {
         if ((pid < 0 && groupAccepted) || (pid > 0 && delivery === 'delivered')) return true
         throw Object.assign(new Error('absent'), { code: 'ESRCH' })
       })
       const firstRead = Promise.withResolvers<ReturnType<typeof activeUnit>>()
       const queried = Promise.withResolvers<undefined>()
-      const query = vi.fn()
+      const query = vi.fn<NonNullable<LinuxScopeInternals['systemctlQuery']>>()
         .mockImplementationOnce(() => { queried.resolve(undefined); return firstRead.promise })
         .mockResolvedValueOnce(fresh)
+        .mockResolvedValue(unloadedUnit())
       const sleep = vi.fn(async () => { throw new Error('unexpected poll delay') })
       const spawnSync = recordingSystemctl()
         .mockReturnValueOnce({ status: 1, stdout: '', stderr: 'Invalid argument' })
@@ -699,7 +724,8 @@ describe('Linux scope establishment and quiescence', () => {
         launched.child.exit(null, 'SIGKILL')
         if (settles) await expect(waiting).resolves.toBeUndefined()
         else await expect(waiting).rejects.toThrow('Invalid argument')
-        expect(query).toHaveBeenCalledTimes(2)
+        expect(query.mock.calls.map(call => call[1][1])).toEqual(state === 'empty'
+          ? ['show', 'show', 'stop'] : ['show', 'show'])
         expect(sleep).not.toHaveBeenCalled()
         expect(launched.result.control).toBe(launched.child.control)
         expect(launched.child.stdout.destroyed).toBe(false)
@@ -837,14 +863,16 @@ describe('Linux scope establishment and quiescence', () => {
     denyProcessGroups()
     const spawnSync = recordingSystemctl()
       .mockReturnValueOnce({ status: 1, stdout: '', stderr: 'Invalid argument' })
-    const launched = launch(async () => activeUnitWithTasks('0'), { spawnSync: spawnSync as never })
+    const query = vi.fn(async (_command: string, _args: readonly string[]) => activeUnitWithTasks('0'))
+    const launched = launch(query, { spawnSync: spawnSync as never })
     consumeLinuxLaunchRequest(launched.requestPath)
     launched.result.owner.signal('SIGKILL')
     try {
       await expect(launched.result.owner.waitForExit()).resolves.toBeUndefined()
       expect(launched.child.exitCode).toBeNull()
       expect(launched.child.signalCode).toBeNull()
-      expect(spawnSync.mock.calls.map(call => call[1]?.[1])).toEqual(['kill', 'stop'])
+      expect(spawnSync.mock.calls.map(call => call[1]?.[1])).toEqual(['kill'])
+      expect(query.mock.calls.map(call => call[1][1])).toEqual(['show', 'stop'])
     } finally {
       launched.child.exit(null, 'SIGKILL')
       await launched.result.direct
@@ -922,23 +950,24 @@ describe('Linux scope establishment and quiescence', () => {
     // Regression: the manager's empty cgroup never ends this unit on its own.
     denyProcessGroups()
     const spawnSync = recordingSystemctl()
-    const launched = launch(async () => activeUnitWithTasks('0'), { spawnSync: spawnSync as never })
+    const query = vi.fn(async (_command: string, _args: readonly string[]) => activeUnitWithTasks('0'))
+    const launched = launch(query, { spawnSync: spawnSync as never })
     launched.result.owner.signal('SIGKILL')
     launched.child.exit(null, 'SIGKILL')
     await expect(launched.result.owner.waitForExit()).resolves.toBeUndefined()
     expect(spawnSync.mock.calls.map(call => call[1])).toEqual([
       ['--user', 'kill', '--kill-who=all', '--signal=SIGKILL', expect.stringMatching(/\.scope$/u)],
-      ['--user', 'stop', expect.stringMatching(/\.scope$/u)],
     ])
+    expect(query).toHaveBeenLastCalledWith('/bin/systemctl', ['--user', 'stop', expect.stringMatching(/\.scope$/u)])
     launched.result.owner.cleanup?.()
   })
 
   it('concludes the empty range even when releasing the leftover scope fails', async () => {
     denyProcessGroups()
-    const spawnSync = recordingSystemctl()
-      .mockImplementationOnce(() => ({ status: 0, stdout: '', stderr: '' }))
-      .mockImplementationOnce(() => { throw new Error('systemctl is gone') })
-    const launched = launch(async () => activeUnitWithTasks('0'), { spawnSync: spawnSync as never })
+    const query = vi.fn()
+      .mockResolvedValueOnce(activeUnitWithTasks('0'))
+      .mockRejectedValueOnce(new Error('systemctl is gone'))
+    const launched = launch(query)
     launched.result.owner.signal('SIGKILL')
     launched.child.exit(null, 'SIGKILL')
     await expect(launched.result.owner.waitForExit()).resolves.toBeUndefined()
@@ -958,11 +987,100 @@ describe('Linux scope establishment and quiescence', () => {
     launched.result.owner.cleanup?.()
   })
 
-  it('keeps waiting for an active empty scope no termination has requested', async () => {
+  it('keeps waiting for an empty scope while its launcher can still enter', async () => {
     const states = [activeUnitWithTasks('0'), unloadedUnit()]
     const launched = launch(async () => states.shift() ?? unloadedUnit())
     await expect(launched.result.owner.waitForExit()).resolves.toBeUndefined()
     expect(launched.spawnSync).not.toHaveBeenCalled()
+    launched.result.owner.cleanup?.()
+  })
+
+  it.each([
+    { events: 'populated 0\nfrozen 0\n', release: true },
+    { events: 'populated 1\nfrozen 0\n', release: false },
+    { events: 'frozen 0\n', release: false },
+    { events: undefined, release: false },
+  ])('uses recursive cgroup population after a natural exit ($events)', async ({ events, release }) => {
+    const group = cgroupFixture()
+    const operations: string[] = []
+    const launched = launch(async (_command, args) => {
+      const unit = args[2]!
+      operations.push(args[1]!)
+      if (args[1] === 'stop' || operations.length > 1) return unloadedUnit()
+      if (!args.includes('--property=ControlGroup')) return activeUnitWithTasks('0')
+      return group.active(unit, events)
+    }, { cgroupRoot: group.root, sleep: async () => {} })
+    consumeLinuxLaunchRequest(launched.requestPath)
+    launched.child.exit(0, null)
+    await launched.result.direct
+    await Promise.all([launched.result.owner.waitForExit(), launched.result.owner.waitForExit()])
+    await launched.result.owner.waitForExit()
+    expect(operations).toEqual(['show', release ? 'stop' : 'show'])
+    expect(launched.spawnSync).not.toHaveBeenCalled()
+    launched.result.owner.cleanup?.()
+  })
+
+  it('rechecks an empty snapshot taken before launcher exit while a descendant survives', async () => {
+    const group = cgroupFixture()
+    const first = Promise.withResolvers<ReturnType<typeof activeUnit>>()
+    const query = vi.fn<NonNullable<LinuxScopeInternals['systemctlQuery']>>()
+      .mockReturnValueOnce(first.promise)
+      .mockImplementationOnce(async (_command, args) => group.active(args[2]!, 'populated 1\n'))
+      .mockResolvedValue(unloadedUnit())
+    const launched = launch(query, { cgroupRoot: group.root, sleep: async () => {} })
+    const waiting = launched.result.owner.waitForExit()
+    const unit = query.mock.calls[0]![1][2]!
+    const beforeEntry = group.active(unit, 'populated 0\n')
+    consumeLinuxLaunchRequest(launched.requestPath)
+    launched.child.exit(0, null)
+    first.resolve(beforeEntry)
+    await waiting
+    expect(query.mock.calls.map(call => call[1][1])).toEqual(['show', 'show', 'show'])
+    await launched.result.direct
+    launched.result.owner.cleanup?.()
+  })
+
+  it.each([undefined, 'user.slice/UNIT', '/user.slice/other.scope', '/user.slice/../user.slice/UNIT'])('retains a scope with an unverified ControlGroup=%s', async (path) => {
+    const group = cgroupFixture()
+    const query = vi.fn<NonNullable<LinuxScopeInternals['systemctlQuery']>>()
+      .mockImplementationOnce(async (_command, args) => {
+        const unit = args[2]!
+        const state = group.active(unit, 'populated 0\n')
+        if (path === undefined) return activeUnitWithTasks('0')
+        return { ...state, stdout: state.stdout.replace(`/user.slice/${unit}`, path.replace('UNIT', unit)) }
+      })
+      .mockResolvedValue(unloadedUnit())
+    const launched = launch(query, { cgroupRoot: group.root, sleep: async () => {} })
+    consumeLinuxLaunchRequest(launched.requestPath)
+    launched.child.exit(0, null)
+    await launched.result.owner.waitForExit()
+    expect(query.mock.calls.map(call => call[1][1])).toEqual(['show', 'show'])
+    await launched.result.direct
+    launched.result.owner.cleanup?.()
+  })
+
+  it('discards kernel evidence obtained across a termination signal', async () => {
+    const reading = Promise.withResolvers<undefined>()
+    const population = Promise.withResolvers<string>()
+    vi.mocked(readFile).mockImplementationOnce(() => {
+      reading.resolve(undefined)
+      return population.promise
+    })
+    const group = cgroupFixture()
+    const query = vi.fn<NonNullable<LinuxScopeInternals['systemctlQuery']>>()
+      .mockImplementationOnce(async (_command, args) => group.active(args[2]!, undefined))
+      .mockResolvedValueOnce(activeUnitWithTasks('1'))
+      .mockResolvedValue(unloadedUnit())
+    const launched = launch(query, { cgroupRoot: group.root, sleep: async () => {} })
+    consumeLinuxLaunchRequest(launched.requestPath)
+    launched.child.exit(0, null)
+    const waiting = launched.result.owner.waitForExit()
+    await reading.promise
+    launched.result.owner.signal('SIGTERM')
+    population.resolve('populated 0\n')
+    await waiting
+    expect(query.mock.calls.map(call => call[1][1])).toEqual(['show', 'show', 'show'])
+    await launched.result.direct
     launched.result.owner.cleanup?.()
   })
 

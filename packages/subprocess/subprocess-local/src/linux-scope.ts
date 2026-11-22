@@ -4,6 +4,7 @@ import { controlPipe } from './control-spawn.ts'
 import { execFile, spawn, spawnSync } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import { existsSync, readFileSync, statSync } from 'node:fs'
+import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { setTimeout as sleepMs } from 'node:timers/promises'
 import type {
@@ -43,6 +44,8 @@ export interface LinuxScopeInternals {
   sleep?: (delayMs: number, signal?: AbortSignal) => Promise<void>
   /** Kernel unix socket table read by the user-manager confirmation; defaults to /proc/net/unix. */
   unixSocketTable?: string
+  /** Mount point of the unified cgroup hierarchy. */
+  cgroupRoot?: string
 }
 
 interface SystemctlResult {
@@ -50,6 +53,13 @@ interface SystemctlResult {
   stdout: string
   stderr: string
   error?: Error
+}
+
+interface UnitState {
+  loadState: string
+  activeState: string
+  tasksCurrent: number | undefined
+  controlGroup: string | undefined
 }
 
 const SYSTEMCTL_TIMEOUT_MS = 5_000
@@ -299,6 +309,7 @@ class SystemdScopeOwner implements BoundProcessOwner {
     private readonly runSync: typeof spawnSync,
     private readonly query: (command: string, args: readonly string[]) => Promise<SystemctlResult>,
     private readonly sleep: (delayMs: number, signal?: AbortSignal) => Promise<void>,
+    private readonly cgroupRoot: string,
   ) {}
 
   inspectTaskCount(): number | undefined {
@@ -386,33 +397,30 @@ class SystemdScopeOwner implements BoundProcessOwner {
     return true
   }
 
-  /**
-   * Prove an active unit with no processes is the empty managed range rather
-   * than a launch still placing its payload. systemd ends a scope only on the
-   * populated-to-empty transition, so a payload killed before it entered the
-   * cgroup leaves the unit active forever. A departed client cannot add another
-   * payload; a consumed request proves the payload already entered the scope,
-   * even while its direct-process exit notification is pending.
-   */
-  private emptyRange(tasksCurrent: number | undefined): boolean {
-    return this.terminationRequested && tasksCurrent === 0
-      && (!this.direct.running() || !existsSync(this.startup.files.requestPath))
+  /** The kernel's populated flag covers descendants in nested cgroups as well. */
+  private async cgroupEmpty(controlGroup: string | undefined): Promise<boolean> {
+    if (!controlGroup?.startsWith('/') || !controlGroup.endsWith(`/${this.unit}`)
+      || controlGroup.split('/').includes('..')) return false
+    let events: string
+    try {
+      events = await readFile(join(this.cgroupRoot, controlGroup, 'cgroup.events'), 'utf8')
+    } catch (_unreadableCgroup) {
+      // A missing or inaccessible hierarchy leaves the manager responsible for reporting exit.
+      return false
+    }
+    return events.split('\n').includes('populated 0')
   }
 
-  /** Release a leftover empty scope so the transient unit is collected and cannot accumulate. */
-  private releaseEmptyRange(): void {
+  /** An empty range stays quiescent if its transient unit has already disappeared or stop fails. */
+  private async releaseEmptyRange(): Promise<void> {
     try {
-      this.runSync(this.systemctl, ['--user', 'stop', this.unit], {
-        env: managerEnvironment(),
-        stdio: 'ignore',
-        timeout: SYSTEMCTL_TIMEOUT_MS,
-      })
-    } catch (_scopeStopFailed) {
-      // The range is already empty; a failed cleanup leaves only the transient unit.
+      await this.query(this.systemctl, ['--user', 'stop', this.unit])
+    } catch (_stopFailed) {
+      // Cleanup is best effort after the managed range is proven empty.
     }
   }
 
-  private parseUnitState(stdout: string): { loadState: string; activeState: string; tasksCurrent: number | undefined } {
+  private parseUnitState(stdout: string): UnitState {
     const values = new Map<string, string>()
     for (const line of stdout.split(/\r?\n/u)) {
       if (line === '') continue
@@ -431,7 +439,8 @@ class SystemdScopeOwner implements BoundProcessOwner {
     // The manager prints this sentinel for a property the unit does not carry.
     const reportedTasks = values.get('TasksCurrent')
     const tasksCurrent = reportedTasks === '[not set]' ? undefined : reportedTasks
-    if (values.size !== (reportedTasks === undefined ? 2 : 3)
+    const controlGroup = values.get('ControlGroup')
+    if (values.size !== 2 + Number(reportedTasks !== undefined) + Number(controlGroup !== undefined)
       || loadState === undefined || activeState === undefined) {
       throw new Error(`systemctl returned incomplete state for ${this.unit}: ${JSON.stringify(stdout.trim())}`)
     }
@@ -441,6 +450,7 @@ class SystemdScopeOwner implements BoundProcessOwner {
     return {
       loadState,
       activeState,
+      controlGroup,
       tasksCurrent: tasksCurrent === undefined ? undefined : Number(tasksCurrent),
     }
   }
@@ -456,12 +466,13 @@ class SystemdScopeOwner implements BoundProcessOwner {
       '--property=LoadState',
       '--property=ActiveState',
       '--property=TasksCurrent',
+      '--property=ControlGroup',
     ])
     // A signal invalidates state queried before its delivery and direct fallback.
     if (generation !== this.wakeGeneration) return true
     const output = `${result.stdout}\n${result.stderr}`
     if (result.status === 0) {
-      const { loadState, activeState, tasksCurrent } = this.parseUnitState(result.stdout)
+      const { loadState, activeState, tasksCurrent, controlGroup } = this.parseUnitState(result.stdout)
       if (loadState === 'not-found' && activeState === 'inactive') return this.absentUnit()
       if (loadState !== 'loaded') {
         throw new Error(
@@ -473,9 +484,17 @@ class SystemdScopeOwner implements BoundProcessOwner {
       if (!['active', 'activating', 'reloading', 'deactivating'].includes(activeState)) {
         throw new Error(`systemctl returned unknown ActiveState for ${this.unit}: ${JSON.stringify(activeState)}`)
       }
-      if (this.emptyRange(tasksCurrent)) {
-        this.releaseEmptyRange()
-        return false
+      if (tasksCurrent === 0) {
+        // During startup a still-empty cgroup can receive its first process. Natural exit
+        // requires a manager observation started after the direct launcher had already exited.
+        const empty = this.terminationRequested
+          ? !this.direct.running() || !existsSync(this.startup.files.requestPath)
+          : !directRunning && activeState === 'active' && await this.cgroupEmpty(controlGroup)
+        if (generation !== this.wakeGeneration) return true
+        if (empty) {
+          await this.releaseEmptyRange()
+          return false
+        }
       }
       if (this.killFailure !== undefined) {
         if (directRunning && this.directKillSettlement !== undefined) {
@@ -659,6 +678,7 @@ export function prepareLinuxTerminalScope(
       internals.spawnSync ?? spawnSync,
       internals.systemctlQuery ?? querySystemctl,
       internals.sleep ?? sleepWithAbort,
+      internals.cgroupRoot ?? '/sys/fs/cgroup',
     ),
     resolveOutcome: outcome => startup.resolveOutcome(outcome),
     cleanup: () => { cleanupLinuxLaunchFiles(files) },
@@ -718,6 +738,7 @@ export function launchLinuxScope(
     internals.spawnSync ?? spawnSync,
     internals.systemctlQuery ?? querySystemctl,
     internals.sleep ?? sleepWithAbort,
+    internals.cgroupRoot ?? '/sys/fs/cgroup',
   )
   return {
     stdin: child.stdin,
